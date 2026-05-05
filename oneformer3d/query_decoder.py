@@ -18,11 +18,6 @@ def _zero_init_last_linear(sequential):
         nn.init.zeros_(last_linear.bias)
 
 
-def _identity_init_linear(linear):
-    """Initialize a square Linear layer as identity."""
-    nn.init.eye_(linear.weight)
-    nn.init.zeros_(linear.bias)
-
 
 class CrossAttentionLayer(BaseModule):
     """Cross attention layer.
@@ -542,76 +537,66 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         # ── Owner-Residual Query Decomposition ──
         self.owner_residual = owner_residual
         if self.owner_residual:
-            # Shared owner: h = norm_query + F_owner(norm_query)
-            #   zero-init last layer → h ≈ norm_query at start
-            self.owner_proj = nn.Sequential(
+            # Shared owner delta: Δ_owner(norm_query)
+            #   h = norm_query + Δ_owner(norm_query)
+            #   zero-init last layer → Δ_owner ≈ 0 → h ≈ norm_query at start
+            self.owner_delta = nn.Sequential(
                 nn.Linear(d_model, d_model),
                 nn.ReLU(),
                 nn.Linear(d_model, d_model),
             )
 
-            # Role owner projections: W_r · h  (identity-init)
-            self.mask_owner_proj = nn.Linear(d_model, d_model)
-            self.geo_owner_proj = nn.Linear(d_model, d_model)
-            self.sem_owner_proj = nn.Linear(d_model, d_model)
-            self.score_owner_proj = nn.Linear(d_model, d_model)
-            self.id_owner_proj = nn.Linear(d_model, d_model)
-
-            # Role-specific residuals: δ_r(norm_query)  (zero-init last layer)
-            self.mask_residual = nn.Sequential(
+            # Role-specific residuals: Δ^r(norm_query)
+            #   q^r = h + Δ^r(norm_query)
+            #   zero-init last layer → Δ^r ≈ 0 → q^r ≈ h ≈ norm_query at start
+            self.mask_delta = nn.Sequential(
                 nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
-            self.geo_residual = nn.Sequential(
+            self.geo_delta = nn.Sequential(
                 nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
-            self.sem_residual = nn.Sequential(
+            self.sem_delta = nn.Sequential(
                 nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
-            self.score_residual = nn.Sequential(
+            self.score_delta = nn.Sequential(
                 nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
-            self.id_residual = nn.Sequential(
+            self.id_delta = nn.Sequential(
                 nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
-
-            # Learnable residual scales α_r — start at 0 for identity-baseline equivalence
-            self.alpha_mask = nn.Parameter(torch.tensor(0.0))
-            self.alpha_geo = nn.Parameter(torch.tensor(0.0))
-            self.alpha_sem = nn.Parameter(torch.tensor(0.0))
-            self.alpha_score = nn.Parameter(torch.tensor(0.0))
-            self.alpha_id = nn.Parameter(torch.tensor(0.0))
 
             self._init_owner_residual()
 
     def _init_owner_residual(self):
-        """Identity-style init so that at iteration 0 every role query
-        approximately equals norm_query (baseline behaviour)."""
-        # owner_proj → 0 so that h = norm_query + 0 ≈ norm_query
-        _zero_init_last_linear(self.owner_proj)
+        """Zero-init all deltas so that at step 0:
+        h = norm_query + 0 ≈ norm_query
+        q^r = h + 0 ≈ norm_query
 
-        # W_r → identity so that W_r · h ≈ h ≈ norm_query
-        for proj in [self.mask_owner_proj, self.geo_owner_proj, self.sem_owner_proj,
-                     self.score_owner_proj, self.id_owner_proj]:
-            _identity_init_linear(proj)
-
-        # δ_r → 0 (zero last layer) so α·δ = 0 regardless of α
-        for res in [self.mask_residual, self.geo_residual, self.sem_residual,
-                    self.score_residual, self.id_residual]:
-            _zero_init_last_linear(res)
+        The model is therefore identical to the ESAM baseline at
+        initialisation, and the deltas grow only as much as the
+        multi-task losses demand role-specific deviation.
+        """
+        _zero_init_last_linear(self.owner_delta)
+        for delta in [self.mask_delta, self.geo_delta, self.sem_delta,
+                      self.score_delta, self.id_delta]:
+            _zero_init_last_linear(delta)
 
     def _compute_role_queries(self, norm_query):
-        """Decompose the shared norm_query into role-specific queries.
+        """Decompose norm_query into role-specific queries.
 
         Returns a dict with keys: mask, geo, sem, score, id, owner.
+        When owner_residual=False, all keys point to the same norm_query
+        (baseline behaviour).
         """
         if not self.owner_residual:
             return dict(
                 mask=norm_query, geo=norm_query, sem=norm_query,
                 score=norm_query, id=norm_query, owner=norm_query)
 
-        # shared owner: residual around norm_query
-        h = norm_query + self.owner_proj(norm_query)
+        # shared owner: h = norm_query + Δ_owner(norm_query)
+        h = norm_query + self.owner_delta(norm_query)
 
-        q_mask = self.mask_owner_proj(h) + self.alpha_mask * self.mask_residual(norm_query)
-        q_geo = self.geo_owner_proj(h) + self.alpha_geo * self.geo_residual(norm_query)
-        q_sem = self.sem_owner_proj(h) + self.alpha_sem * self.sem_residual(norm_query)
-        q_score = self.score_owner_proj(h) + self.alpha_score * self.score_residual(norm_query)
-        q_id = self.id_owner_proj(h) + self.alpha_id * self.id_residual(norm_query)
+        # role-specific: q^r = h + Δ^r(norm_query)
+        q_mask = h + self.mask_delta(norm_query)
+        q_geo = h + self.geo_delta(norm_query)
+        q_sem = h + self.sem_delta(norm_query)
+        q_score = h + self.score_delta(norm_query)
+        q_id = h + self.id_delta(norm_query)
 
         return dict(mask=q_mask, geo=q_geo, sem=q_sem, score=q_score, id=q_id, owner=h)
 
